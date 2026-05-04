@@ -1,0 +1,26 @@
+# Model checkpoints (too large for git)
+checkpoints/
+
+# Large live output files
+results/*.jsonl
+results/eval_log.txt
+results/test_answer_only.json
+results/answer_only_results.json
+results/cot_2k_results.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+.env
+
+# Leftover LaTeX style files
+acl.sty
+acl_natbib.bst
+report.html
+
+# Raw PDFs (instructions/proposals)
+CS533_DL4NLP_Final_Project*.pdf
+CS533_Project_Proposal.pdf
