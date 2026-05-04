@@ -1,0 +1,466 @@
+% ACL-style layout using only standard LaTeX packages (no acl.sty needed)
+% Compile: pdflatex report.tex && bibtex report && pdflatex report.tex && pdflatex report.tex
+
+\documentclass[11pt,twocolumn]{article}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{titlesec}
+\usepackage{natbib}
+\usepackage{caption}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdfborder={0 0 0}
+}
+
+\geometry{
+  top=1in, bottom=1in,
+  left=0.75in, right=0.75in,
+  columnsep=0.25in
+}
+
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{1em}{}
+\titleformat{\paragraph}[runin]{\normalfont\normalsize\bfseries}{}{0em}{}[.]
+
+\captionsetup{font=small, labelfont=bf}
+
+\makeatletter
+\renewcommand{\maketitle}{%
+  \twocolumn[{%
+    \centering
+    {\LARGE\bfseries \@title \par}\vspace{0.5em}
+    {\large \@author \par}\vspace{1em}
+  }]
+}
+\makeatother
+
+\title{Does Chain-of-Thought Supervision Improve\\Compositional Visual Question Answering?\\A Controlled Study with BLIP-2 on CLEVR}
+
+\author{
+  Niket Pathak \quad Srivatsa Kamballa \\
+  Department of Computer Science, University of Illinois Chicago \\
+  \texttt{\{npathak, skambal\}@uic.edu}
+}
+
+\begin{document}
+\maketitle
+
+%% ---------------------------------------------------------------
+\begin{abstract}
+Chain-of-Thought (CoT) supervision has shown impressive gains for text-based reasoning tasks, but whether it helps small vision-language models on compositional visual reasoning is still an open question. In this work, we run a controlled experiment on the CLEVR visual question answering benchmark, comparing three setups: a zero-shot pretrained BLIP-2 baseline with no fine-tuning, answer-only supervised fine-tuning, and chain-of-thought supervised fine-tuning where the model is trained to generate step-by-step reasoning traces derived from CLEVR's functional programs before predicting the answer. All fine-tuned models use BLIP-2 with OPT-2.7B and LoRA, trained on 50,000 samples. Our results show that answer-only fine-tuning reaches \textbf{45.95\%} accuracy while CoT supervision reaches \textbf{28.90\%} on a 2,000-sample validation set — both well above the zero-shot baseline of 8.75\%. Digging into the numbers reveals something interesting: CoT actually \textit{beats} answer-only on short, simple questions (51.43\% vs. 34.29\% for program depth $\leq$4), but falls apart on long, multi-step chains. We think this happens because a 2.7B parameter model simply does not have enough capacity to maintain accurate visual grounding across 15--20 reasoning steps. The takeaway is that CoT supervision is most useful when the reasoning chain stays within what the model can handle.
+\end{abstract}
+
+%% ---------------------------------------------------------------
+\section{Introduction}
+
+Visual Question Answering (VQA) sits at the intersection of computer vision and natural language processing — a model must look at an image, read a question, and produce the right answer. This sounds straightforward, but when the question requires chaining together multiple observations (``Are there more red spheres than blue cubes to the left of the large metal object?''), it becomes genuinely hard. The CLEVR benchmark \cite{johnson2017clevr} was built precisely for this kind of compositional reasoning, with synthetic 3D scenes and questions that can require up to 20 logical steps to answer correctly.
+
+One of the more exciting ideas to emerge from the NLP community in recent years is Chain-of-Thought (CoT) prompting \cite{wei2022chain}, where instead of jumping straight to an answer, a model is encouraged to write out intermediate reasoning steps first. This technique has produced large accuracy gains on math word problems and commonsense reasoning tasks, especially with large language models. The intuition is simple: writing down the reasoning process forces the model to stay on track, and each step serves as context for the next.
+
+What is much less clear is whether this same idea carries over to vision-language models, particularly smaller ones in the 2--3B parameter range. Most of the CoT literature reports results on text-only benchmarks with 70B+ models. Getting a small VLM to generate a faithful 15-step reasoning chain while also correctly grounding each step in the image is a significantly harder ask.
+
+We decided to put this to a direct test. Our setup is deliberately simple: take the same model (BLIP-2 with OPT-2.7B), fine-tune it twice on the same 50,000 training samples — once with answer-only supervision and once with full chain-of-thought supervision — and compare the results on the same validation set. We also keep a zero-shot baseline to show what the pretrained model can do without any fine-tuning at all.
+
+The CoT traces we use come directly from CLEVR's functional programs. Each question in CLEVR is paired with a symbolic execution tree describing exactly what operations are needed to answer it. We convert these operations to natural language steps, giving us clean, deterministic, noise-free reasoning traces without needing to distill from a larger teacher model.
+
+Our main findings are:
+\begin{itemize}
+    \item Fine-tuning matters enormously: the zero-shot model gets only 8.75\%, while answer-only fine-tuning reaches 45.95\% — a gain of over 37 percentage points.
+    \item CoT supervision underperforms answer-only overall (28.90\% vs. 45.95\%), but this masks an interesting split: CoT is better on simple questions and worse on complex ones.
+    \item The primary failure mode of CoT is visual hallucination — the model generates plausible-looking reasoning steps but fills in wrong attribute values.
+    \item We hit and fixed a subtle but critical tokenization bug in BLIP-2+OPT involving BOS/EOS token collision that caused models to stop generating after a single token.
+\end{itemize}
+
+%% ---------------------------------------------------------------
+\section{Related Work}
+
+\paragraph{Visual Question Answering and CLEVR.}
+The VQA task was formally introduced by \citet{antol2015vqa}, who released a large-scale dataset pairing real images with crowd-sourced questions. While popular, real-image VQA datasets are often criticized for containing dataset biases that models exploit \cite{johnson2017clevr}. CLEVR addressed this by generating questions programmatically from symbolic scene graphs and functional programs. This design choice is especially useful for our study because the functional programs give us ground-truth reasoning traces for free — we can derive CoT supervision deterministically without any annotation effort or LLM distillation.
+
+\paragraph{Vision-Language Models.}
+The field has moved quickly toward large pretrained VLMs. BLIP-2 \cite{li2023blip} introduced the Querying Transformer (Q-Former), a trainable bridge module that connects a frozen vision encoder to a frozen language model, enabling strong zero-shot VQA without end-to-end training of the full model. LLaVA \cite{liu2023llava} and InstructBLIP \cite{dai2023instructblip} pushed this further with instruction-following fine-tuning. Despite their capabilities, these models are large and expensive. Our choice of BLIP-2 with OPT-2.7B was driven by its open-source availability, HuggingFace compatibility, and its ability to fit on a single GPU when fine-tuned with LoRA.
+
+\paragraph{Chain-of-Thought Reasoning.}
+\citet{wei2022chain} demonstrated that prompting GPT-3 with intermediate reasoning steps dramatically improves performance on arithmetic and symbolic reasoning benchmarks. \citet{kojima2022large} showed that even the simple instruction ``Let's think step by step'' elicits useful reasoning from large models without any few-shot examples. These findings sparked a wave of interest in CoT-style training and prompting. On the training side, \citet{ho2022large} showed that smaller models can benefit from CoT supervision generated by larger teacher models — a technique sometimes called ``reasoning distillation.'' Our approach is different: instead of using a teacher model, we derive CoT traces directly from CLEVR's functional programs, which gives us exact and unambiguous supervision.
+
+An important caveat in all of this work is that CoT benefits tend to be most pronounced in very large models. \citet{wei2022chain} observed minimal gains below roughly 100B parameters for text-only tasks. We hypothesize a similar threshold exists for vision-language CoT, and our experiments provide initial evidence for this.
+
+\paragraph{Parameter-Efficient Fine-Tuning.}
+LoRA \cite{hu2022lora} has become the standard approach for fine-tuning large models on limited compute. Rather than updating all model weights, LoRA injects small low-rank matrices into specific layers and trains only those. In our setup, this brings the trainable parameter count from 3.7B down to roughly 3.7M — less than 0.1\% of the total — while still allowing meaningful adaptation of the language model.
+
+%% ---------------------------------------------------------------
+\section{Problem Statement}
+
+Given an image $I$ and a natural language question $Q$, the task is to produce a short answer $a \in \mathcal{A}$. The answer set $\mathcal{A}$ for CLEVR consists of yes/no responses, colors (red, blue, green, purple, gray, cyan, brown, yellow), shapes (cube, sphere, cylinder), sizes (small, large), materials (rubber, metal), and integers from 0 to 10 — 28 possible answers in total.
+
+We set up three conditions to study the effect of supervision type:
+
+\begin{enumerate}
+    \item \textbf{Zero-shot}: The pretrained BLIP-2 model with no fine-tuning, evaluated directly on CLEVR. This gives us a sense of what the model already knows without any task-specific training.
+    \item \textbf{Answer-only}: The model is fine-tuned to predict $a$ directly from $(I, Q)$. The training target is just the answer word.
+    \item \textbf{Chain-of-Thought}: The model is fine-tuned to first generate a multi-step reasoning trace $r$ derived from the CLEVR functional program, followed by the final answer. The training target is the full sequence: $r$ + ``Therefore, the answer is: $a$''.
+\end{enumerate}
+
+Conditions (2) and (3) use identical architectures, data, and hyperparameters except for the supervision signal, making the comparison controlled. Our central question is whether the additional reasoning supervision in condition (3) improves answer accuracy over the simpler condition (2).
+
+%% ---------------------------------------------------------------
+\section{Technical Approach}
+
+\subsection{Model Architecture}
+
+Our backbone is \texttt{Salesforce/blip2-opt-2.7b}, which consists of three components working in sequence. The \textbf{Vision Encoder} (ViT-L/14) takes the input image and encodes it into a sequence of patch-level feature vectors. These features are then passed to the \textbf{Q-Former}, a small transformer that uses 32 learned query tokens to cross-attend to the visual features and distill them into 32 compact visual embeddings. Finally, the \textbf{Language Model} (OPT-2.7B) receives these 32 visual tokens as a prefix, followed by the tokenized question, and generates the answer token by token in an autoregressive manner.
+
+During fine-tuning, we freeze both the Vision Encoder and the Q-Former entirely. Only the OPT language model is updated, via LoRA applied to the query and value projection matrices in each attention layer (rank $r=16$, $\alpha=32$, dropout 0.1). This yields approximately 3.7 million trainable parameters out of 3.7 billion total — well under 0.1\%. Freezing the vision components keeps visual feature extraction stable and makes training feasible on a single consumer GPU.
+
+\subsection{Generating CoT Traces from CLEVR Programs}
+
+Every question in CLEVR comes with a functional program — a sequence of symbolic operations that, when executed on the scene, produce the answer. For example, the question ``How many blue cubes are there?'' corresponds to the program \texttt{scene} $\to$ \texttt{filter\_color[blue]} $\to$ \texttt{filter\_shape[cube]} $\to$ \texttt{count}.
+
+We convert each program operation to a natural language step using a fixed template dictionary. A few examples of the mapping are shown below:
+
+\begin{center}
+\small
+\begin{tabular}{lp{0.48\columnwidth}}
+\toprule
+\textbf{Program operation} & \textbf{Natural language step} \\
+\midrule
+\texttt{scene} & ``Look at all objects in the scene.'' \\
+\texttt{filter\_color[blue]} & ``Filter to keep only blue objects.'' \\
+\texttt{filter\_shape[cube]} & ``Filter to keep only cube shaped objects.'' \\
+\texttt{count} & ``Count the remaining objects.'' \\
+\texttt{unique} & ``Identify the single matching object.'' \\
+\texttt{relate[left]} & ``Find objects spatially related to the current object.'' \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The steps are numbered and concatenated into a full reasoning trace, then the answer is appended:
+\begin{quote}
+\small\textit{``Step 1: Look at all objects in the scene. Step 2: Filter to keep only blue colored objects. Step 3: Filter to keep only cube shaped objects. Step 4: Count the remaining objects. Therefore, the answer is: 2.''}
+\end{quote}
+
+For the answer-only model, the same question uses just \texttt{"2"} as the target. The key advantage of this approach over LLM-distilled CoT is that the reasoning traces are exact and deterministic — there is no ambiguity or hallucination in the supervision signal itself.
+
+\subsection{Answer-Weighted Loss Function}
+
+A practical challenge with CoT training is that the reasoning steps dominate the loss. A typical CoT target might be 100--150 tokens long, while the actual answer word is just 1 token. If we use standard cross-entropy loss, the model will spend most of its learning budget getting the step templates right and comparatively little learning to get the answer correct.
+
+To address this, we use a custom loss function that upweights the cross-entropy at the final answer token and the two tokens immediately preceding it by a factor of $5\times$. This keeps the model honest: even if the reasoning steps are fluent, getting the answer wrong is penalized heavily. We found this to be important in early experiments where the model would generate perfect-looking reasoning chains but then guess the answer incorrectly.
+
+\subsection{Fixing the BOS/EOS Token Collision in OPT}
+
+One of the more frustrating implementation issues we encountered was specific to OPT's tokenizer. In OPT, the beginning-of-sequence token (BOS) and the end-of-sequence token (EOS) share the same token ID (id=2). This creates a subtle trap: when the tokenizer encodes a target sequence with default settings, it prepends a BOS token at position 0. During training, if the model learns to predict this BOS token as its very first output, it will generate token id=2 at inference time — which the decoding loop interprets as EOS and immediately terminates generation.
+
+In early runs, this caused the CoT model to output a single character and stop. The fix is to mask the BOS token out of the training labels by setting \texttt{labels[0] = -100}, which tells PyTorch's cross-entropy loss to ignore that position. We keep the BOS token in the input sequence because OPT was pretrained with BOS as a positional anchor — removing it degrades generation quality. This single fix eliminated the premature stopping behavior entirely.
+
+%% ---------------------------------------------------------------
+\section{Experimental Setup}
+
+\subsection{Research Questions}
+
+This study is organized around three concrete research questions:
+
+\begin{enumerate}
+    \item \textbf{RQ1}: Does CoT supervision improve answer accuracy over answer-only fine-tuning on compositional VQA?
+    \item \textbf{RQ2}: How does the benefit (or cost) of CoT supervision vary with reasoning chain length?
+    \item \textbf{RQ3}: What are the primary failure modes of CoT-supervised models on CLEVR?
+    \item \textbf{RQ4}: Is CoT supervision an effective strategy for small-capacity vision-language models (2--3B parameters), or does it require larger models to realize its benefits?
+\end{enumerate}
+
+\subsection{Dataset}
+
+We use CLEVR v1.0 \cite{johnson2017clevr} (\url{https://cs.stanford.edu/people/jcjohns/clevr/}), which contains over 700,000 question-answer pairs across 70,000 training scenes and 15,000 validation scenes. Each question is generated programmatically from a scene graph, ensuring full control over the types of reasoning required. Table~\ref{tab:data} summarizes the splits we use.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Split} & \textbf{Full Size} & \textbf{Used} & \textbf{Avg. Depth} \\
+\midrule
+Train      & 699,989 & 50,000 & 8.4 \\
+Validation & 149,991 &  2,000 & 8.4 \\
+\bottomrule
+\end{tabular}
+\caption{CLEVR v1.0 dataset statistics. We use a 50K training subset and evaluate on 2,000 validation samples.}
+\label{tab:data}
+\end{table}
+
+Questions fall into five categories based on the type of answer required: \textit{count} (how many?), \textit{exist} (is there?), \textit{query\_attr} (what color/shape/material/size?), \textit{compare\_attr} (same shape as?), and \textit{compare\_int} (more than?). We use program depth — the number of operations in the functional program — as a proxy for how hard each question is. Questions with depth $\leq 4$ we call ``short,'' and questions with depth $\geq 5$ we call ``long.'' In our 2,000-sample evaluation set, 35 questions are short and 1,965 are long, reflecting the distribution in the original dataset.
+
+We chose 50,000 training samples rather than the full 700,000 for practical reasons: training on the full dataset would take over a week on our hardware. 50,000 samples is a reasonable subset that covers the full distribution of question types and depths. Our code and evaluation scripts are available at \url{https://github.com/Srivatsa03/CS533-Project}.
+
+\subsection{Training Configuration}
+
+Table~\ref{tab:hyper} shows the hyperparameters used for both models. The most notable difference is that we use a lower learning rate ($1 \times 10^{-5}$ vs. $5 \times 10^{-5}$) and fewer epochs (3 vs. 10) for the CoT model. This was necessary because the CoT training signal is much denser — the model has to learn both the reasoning template structure and the answer. With a higher learning rate, the loss dropped below 0.05 by the end of epoch 1, which was a clear sign of template memorization rather than generalization.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Answer-Only} & \textbf{CoT} \\
+\midrule
+Epochs              & 10               & 3 \\
+Learning rate       & $5\times10^{-5}$ & $1\times10^{-5}$ \\
+Batch size          & 16               & 16 \\
+Grad. accum. steps  & 2                & 2 \\
+Warmup ratio        & 6\%              & 6\% \\
+Weight decay        & 0.01             & 0.01 \\
+Precision           & BF16             & BF16 \\
+Answer loss weight  & 1.0              & 5.0 \\
+Max new tokens (eval) & 5              & 200 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameters for both fine-tuned models. LoRA rank $r=16$, $\alpha=32$ for both.}
+\label{tab:hyper}
+\end{table}
+
+We train on AWS EC2 g6xe.large with an NVIDIA L40S GPU (48GB VRAM). Training in BF16 precision avoids the NaN gradient issues we observed with FP16, which is particularly important for long CoT sequences where gradient magnitudes can spike.
+
+\subsection{Evaluation Protocol}
+
+We evaluate all three models on the same 2,000-sample validation subset, using exact string match against lowercased ground-truth answers. For the answer-only model and zero-shot baseline, the predicted answer is extracted from the generated text using a priority-ordered list of all valid CLEVR tokens — we check whether the generated text starts with a known answer word, then fall back to word-boundary regex matching. For the CoT model, we first try to extract the answer from the pattern ``Therefore, the answer is: [answer]'' using a regex, and only fall back to the priority list if that fails. All inference uses greedy decoding with \texttt{num\_beams=1}.
+
+%% ---------------------------------------------------------------
+\section{Results}
+
+\subsection{Overall Accuracy}
+
+Table~\ref{tab:overall} shows the top-level results. The zero-shot model scores only 8.75\%, which is close to what you would expect from a model that has never seen CLEVR-style questions — it mostly generates free-form text that doesn't match the expected short answer format. Both fine-tuned models improve dramatically, with answer-only reaching 45.95\% (+37.2 percentage points over zero-shot) and CoT reaching 28.90\% (+20.2 pp). The gap between the two fine-tuned models is 17.05 percentage points in favor of the simpler approach.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{lp{1.5cm}cc}
+\toprule
+\textbf{Model} & \textbf{Setup} & \textbf{Acc.} & \textbf{$\Delta$ Zero-shot} \\
+\midrule
+BLIP-2        & Zero-shot   & 8.75\%           & --- \\
++LoRA         & Ans.-only   & \textbf{45.95\%} & +37.2 pp \\
++LoRA         & CoT         & 28.90\%          & +20.2 pp \\
+\bottomrule
+\end{tabular}
+\caption{Overall accuracy on 2,000 CLEVR validation samples. $\Delta$ is the gain over zero-shot.}
+\label{tab:overall}
+\end{table}
+
+Figure~\ref{fig:overall} shows these results visually. The gap between answer-only and CoT is large enough to be meaningful, but the fact that both fine-tuned models leave the zero-shot model far behind tells us that fine-tuning is genuinely learning useful task-specific patterns from CLEVR.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\columnwidth]{fig1_overall_accuracy.png}
+\caption{Overall accuracy across all three models. Fine-tuning dramatically improves over zero-shot regardless of supervision type.}
+\label{fig:overall}
+\end{figure}
+
+\subsection{Accuracy by Question Type}
+
+Table~\ref{tab:bytype} breaks down accuracy across the five CLEVR question types.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Question Type} & \textbf{Zero-shot} & \textbf{Answer-only} & \textbf{CoT} \\
+\midrule
+compare\_attr & 11.23\% & 50.41\% & 34.38\% \\
+compare\_int  & 28.74\% & \textbf{55.17\%} & 21.84\% \\
+count         &  0.00\% & 34.90\% & 24.71\% \\
+exist         & 14.00\% & \textbf{61.00\%} & 32.33\% \\
+query\_attr   &  4.14\% & 36.78\% & 23.57\% \\
+\bottomrule
+\end{tabular}
+\caption{Accuracy by question type across all three models.}
+\label{tab:bytype}
+\end{table}
+
+A few things stand out. First, the zero-shot model scores 0\% on counting questions — it never produces a bare number like ``3'', instead generating full sentences. Second, the answer-only model does best on existence questions (61.00\%), which makes sense since these have binary yes/no answers and the model only needs to recognize the presence or absence of an object. Third, the CoT model suffers most on \textit{compare\_int} questions ($-33\%$ relative to answer-only), which ask things like ``Are there more red cubes than blue spheres?'' These require two separate counting sub-programs, and the long reasoning chain gives the model more opportunities to make errors. Figure~\ref{fig:bytype} shows the full breakdown visually, and Figure~\ref{fig:delta} highlights how much CoT loses relative to the answer-only baseline for each type.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\columnwidth]{fig2_by_question_type.png}
+\caption{Accuracy by question type for all three models.}
+\label{fig:bytype}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\columnwidth]{fig4_delta.png}
+\caption{CoT accuracy minus answer-only accuracy per question type. All five types show a negative delta.}
+\label{fig:delta}
+\end{figure}
+
+\subsection{Accuracy by Reasoning Depth}
+
+The most interesting finding in our results comes from splitting by program depth. Table~\ref{tab:depth} shows accuracy for short questions (depth $\leq 4$) versus long questions (depth $\geq 5$).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Depth} & \textbf{Zero-shot} & \textbf{Answer-only} & \textbf{CoT} \\
+\midrule
+Short ($\leq$4 steps) & 2.86\%  & 34.29\% & \textbf{51.43\%} \\
+Long ($\geq$5 steps)  & 8.85\%  & \textbf{46.16\%} & 28.50\% \\
+\bottomrule
+\end{tabular}
+\caption{Accuracy by reasoning depth. CoT outperforms answer-only on short questions by 17 percentage points.}
+\label{tab:depth}
+\end{table}
+
+On short questions, CoT achieves 51.43\% versus 34.29\% for answer-only — a 17-point improvement. On long questions the situation completely reverses: answer-only wins by 17.66 points. This crossover is not a coincidence. Short CLEVR questions involve at most 4 reasoning steps, which is a short enough chain that a 2.7B model can generate faithfully. For these questions, having the intermediate steps in the training signal seems to genuinely help the model focus on the right attributes. But as the chain length grows to 10, 15, or even 19 steps, the model starts drifting — it generates steps that are structurally correct but filled with wrong values. Figure~\ref{fig:depth} makes this crossover clear.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\columnwidth]{fig3_by_depth.png}
+\caption{Accuracy by reasoning depth. The crossover between answer-only and CoT is the key finding of this study.}
+\label{fig:depth}
+\end{figure}
+
+\subsection{Training Dynamics}
+
+Table~\ref{tab:loss} and Figure~\ref{fig:loss} show how training loss evolved for both models.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ccc}
+\toprule
+\textbf{Epoch} & \textbf{Answer-only Loss} & \textbf{CoT Loss} \\
+\midrule
+0.25 & $\sim$3.1 & 0.730 \\
+0.50 & $\sim$1.8 & 0.241 \\
+1.00 & $\sim$1.2 & 0.170 \\
+2.00 & $\sim$0.9 & 0.162 \\
+3.00 & $\sim$0.7 & 0.159 \\
+\bottomrule
+\end{tabular}
+\caption{Training loss for both models. CoT converges faster due to structured step templates.}
+\label{tab:loss}
+\end{table}
+
+The CoT model converges much faster than the answer-only model — its loss drops from 3.4 to 0.24 within the first half epoch. This initially looked like a good sign, but it turned out to be partly explained by the model learning the repeating structure of step templates (``Step N: Filter to keep only...'') rather than the actual reasoning. The answer-only loss starts high and decreases more gradually because each training example has a different one or two-word target with no structural patterns to exploit.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\columnwidth]{fig5_loss_curves.png}
+\caption{Training loss curves. CoT converges faster due to the predictable structure of reasoning step templates.}
+\label{fig:loss}
+\end{figure}
+
+\subsection{Error Analysis}
+
+Figure~\ref{fig:error} summarizes where the CoT model fails. The left panel shows the most common wrong predictions: the model disproportionately outputs common answer tokens like ``yes'', ``no'', ``0'', and ``red'' even when they are incorrect. This is a classic high-frequency bias — when the reasoning chain breaks down, the model falls back to the most common answers it saw during training. The right panel shows the correct/wrong split per question type, where \textit{count} questions are the hardest for the CoT model: it gets about 75\% of them wrong, and nearly all of those wrong predictions are ``0'' regardless of the actual answer.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.98\columnwidth]{fig6_error_analysis.png}
+\caption{Left: most frequent wrong predictions for the CoT model. Right: correct vs. wrong breakdown per question type.}
+\label{fig:error}
+\end{figure}
+
+\subsection{Qualitative Examples}
+
+Looking at individual predictions helps explain the quantitative results.
+
+\paragraph{Correct CoT (depth 5):}
+\begin{quote}
+\small \textbf{Q}: ``What is the material of the big purple object?''\\
+\textbf{GT}: metal\\
+\textbf{Generated}: ``Step 1: Look at all objects in the scene. Step 2: Filter to keep only large sized objects. Step 3: Filter to keep only purple colored objects. Step 4: Identify the single matching object. Step 5: Identify the material of the object. Therefore, the answer is: metal.'' \checkmark
+\end{quote}
+This is an example where CoT works well: the chain is short, each step correctly narrows down the object, and the final answer is extracted cleanly.
+
+\paragraph{Incorrect CoT (visual hallucination):}
+\begin{quote}
+\small \textbf{Q}: ``What is the color of the large shiny sphere?''\\
+\textbf{GT}: purple\\
+\textbf{Generated}: ``\ldots Filter to keep only large sized objects. Filter to keep only metal material objects. Filter to keep only sphere shaped objects. \ldots Therefore, the answer is: red.'' $\times$\\
+\textit{The steps look correct but the final answer is wrong, suggesting the model did not ground the color attribute in the image.}
+\end{quote}
+
+\paragraph{Correct Answer-only (simple binary question):}
+\begin{quote}
+\small \textbf{Q}: ``Is there a large blue sphere?''\\
+\textbf{GT}: yes\\
+\textbf{Generated}: ``yes'' \checkmark\\
+\textit{Answer-only handles binary questions cleanly with minimal output.}
+\end{quote}
+
+\paragraph{Degenerate CoT (complex chain):}
+\begin{quote}
+\small \textbf{Q}: ``How many metallic objects are big blue cubes or blue objects?''\\
+\textbf{GT}: 2\\
+\textbf{Generated}: ``Step: 0. Therefore, the answer is: 0.'' $\times$\\
+\textit{On very complex questions, the CoT model collapses to a degenerate one-step output.}
+\end{quote}
+
+The last example is telling. Complex union/intersection queries require the model to maintain two parallel reasoning threads simultaneously, which is beyond what the current architecture and training can handle reliably.
+
+\subsection{Comparison with Prior Work}
+
+For context, specialized models trained end-to-end on CLEVR report accuracies above 95\% \cite{johnson2017clevr}. Our best result of 45.95\% is substantially lower, but this is expected: those models use task-specific architectures, full training data (700K samples), and end-to-end optimization. Our goal is not to match state-of-the-art CLEVR performance but to isolate the effect of CoT supervision within a fixed small VLM. The relevant comparison is between our three conditions, not against specialized systems.
+
+\subsection{Ablation Discussion}
+
+Our experimental design naturally forms a three-way ablation across supervision type. The zero-shot condition isolates the value of any fine-tuning at all: removing it costs 37 percentage points. The answer-only vs.\ CoT comparison isolates the effect of reasoning supervision specifically: switching from answer-only to CoT costs 17 points overall but gains 17 points on short questions. Within the CoT model, the answer-weighted loss ($5\times$ upweight on the final answer token) was critical — without it, early experiments showed the model generating fluent reasoning chains but guessing answers at random. The BOS/EOS masking fix was equally load-bearing: without it, the CoT model collapsed to single-token outputs on every question.
+
+%% ---------------------------------------------------------------
+\section{Discussion}
+
+The results paint a nuanced picture. CoT supervision is not universally helpful or harmful — its effect depends strongly on how long the required reasoning chain is relative to what the model can reliably generate.
+
+For short chains, CoT provides genuine value. The intermediate steps act as structured supervision that guides the model to attend to the right object attributes in the right order. For a question like ``What material is the big purple object?'', a 5-step chain is easy enough to generate faithfully, and having that chain as a training target apparently helps the model build better representations of the visual reasoning process.
+
+For long chains, the calculus flips. A 19-step chain requires the model to correctly identify up to 19 attribute values and spatial relationships from the image, maintain coherent state across those steps, and then land on the right answer. OPT-2.7B does not have the capacity to do this reliably. The most common failure mode is not that the model generates incoherent text — it generates structurally plausible reasoning steps that happen to contain wrong values. This is arguably a harder failure mode to diagnose than garbage output, because the output looks reasonable but is incorrect.
+
+Addressing RQ4 directly: our results suggest that CoT supervision is \textit{conditionally} effective for small-capacity models. It works when the required reasoning chain is short enough to fit within the model's generation capacity, but fails beyond that threshold. A 2.7B model is not inherently incompatible with CoT supervision — it is incompatible with \textit{long} CoT supervision. This is a meaningful distinction: it implies that CoT can still be useful for small models on tasks where reasoning chains are short, but should not be expected to help on tasks requiring deep multi-step chains.
+
+We also note that the zero-shot baseline's near-zero performance on counting questions is itself informative. The pretrained BLIP-2+OPT model was not designed for short-answer VQA and tends to generate full sentences. Fine-tuning provides the crucial adaptation to CLEVR's output format regardless of whether CoT supervision is used.
+
+\subsection{Limitations}
+
+Several limitations of this study are worth stating explicitly. First, the model size (2.7B parameters) is small by today's standards — larger models such as LLaVA-13B or InstructBLIP-13B may handle longer reasoning chains more reliably, shifting the crossover point we observed. Second, we train on only 50,000 of the 700,000 available training examples due to compute constraints, which likely leaves accuracy headroom on the table. Third, the CoT traces are generated from rigid templates, meaning every \texttt{filter\_color[blue]} always produces the same natural language step — the model may be partially learning template patterns rather than visual reasoning. Finally, we use greedy decoding throughout; beam search might produce more coherent multi-step chains and is worth exploring in future work.
+
+%% ---------------------------------------------------------------
+\section{Conclusions and Future Work}
+
+We set out to answer a straightforward question: does training with explicit chain-of-thought supervision improve a vision-language model's accuracy on compositional VQA? The short answer is: it depends. Overall, answer-only fine-tuning wins by 17 percentage points (45.95\% vs. 28.90\%). But that aggregate masks a real crossover: CoT is better on short, simple questions and worse on long, complex ones.
+
+The practical implication is that CoT supervision should be matched to the model's capacity. For a 2.7B model on CLEVR, that capacity threshold sits somewhere around 4--5 reasoning steps. Beyond that, the benefits of explicit intermediate supervision are outweighed by the difficulty of generating a long, accurate chain. Larger models — say, 7B or 13B parameters — might push this threshold higher, which would be worth testing.
+
+Several other directions follow naturally from this work. First, it would be useful to investigate \textit{partial} CoT supervision: instead of requiring the model to generate the full reasoning chain, supervise only the last one or two steps and the answer. This might give some of the benefits of structured supervision without requiring the model to maintain state across 20 steps. Second, the data efficiency question is interesting: if we have only 1,000 training samples instead of 50,000, does CoT supervision help more? Limited data regimes are where structured supervision tends to add the most value. Finally, replacing the simple greedy decoding with beam search might improve CoT coherence and reduce the hallucination problem, though it would slow down inference considerably.
+
+One broader takeaway from this project is that implementation details matter a lot when working with BLIP-2. The BOS/EOS collision bug, the question padding consistency between training and inference, the FP16/BF16 precision issue — any one of these could reduce accuracy to near-zero without an obvious error message. Getting these details right was as important as the experimental design itself.
+
+%% ---------------------------------------------------------------
+\section{Team Work Division and Overall Experience}
+
+\paragraph{Niket Pathak} was primarily responsible for the data pipeline side of the project: designing the program-to-CoT template mapping, implementing \texttt{program\_to\_cot.py} and \texttt{build\_dataset.py}, handling the CLEVR download and preprocessing, and verifying the quality of generated reasoning traces. Niket also contributed to writing the related work section and parts of the analysis.
+
+\paragraph{Srivatsa Kamballa} took the lead on the model and training infrastructure: implementing \texttt{model.py}, \texttt{dataset.py}, and \texttt{train.py}, writing the custom \texttt{AnswerWeightedTrainer}, setting up the AWS EC2 environment, debugging all training issues including the BOS/EOS collision, the warmup steps deprecation, and the FP16 NaN gradient problem, and running all three evaluation experiments (zero-shot, answer-only, CoT). Srivatsa also led the analysis, visualization, and report writing.
+
+\paragraph{Overall Experience.} This project gave us real experience with the full lifecycle of a VLM fine-tuning experiment — from data preparation and environment setup through training, debugging, evaluation, and interpretation. The most technically challenging part was debugging the tokenization issues in BLIP-2+OPT, which required understanding the model's internal token handling at a low level. The most intellectually interesting part was the depth-stratified result: we initially expected CoT to either clearly win or clearly lose, and the crossover behavior was genuinely surprising. It pushed us to think more carefully about what makes CoT supervision effective and what its limits are. If we were to continue this project, we would prioritize testing with larger models to see if the crossover point shifts.
+
+%% ---------------------------------------------------------------
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
